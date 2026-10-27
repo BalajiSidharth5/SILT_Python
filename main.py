@@ -1,5 +1,12 @@
+import os
+os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"  # keep joystick events when the Qt window has focus
+
+import sys
 import pygame
 import socket
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
+from ui import PilotWindow
 
 # Constants
 
@@ -34,6 +41,15 @@ def Connecting_Controller():
     joystick.init()
 
     print(joystick.get_name(), "is Connected. \n ")
+    return joystick
+
+def get_controller():
+    # Non-blocking version of Connecting_Controller. Returns a joystick, or None when nothing is plugged in.
+    pygame.event.pump()
+    if pygame.joystick.get_count() == 0:
+        return None
+    joystick = pygame.joystick.Joystick(0)
+    joystick.init()
     return joystick
 
 def get_dpad_presses():
@@ -133,25 +149,57 @@ def send_packet(packet): # Transfers using UDP
     s.sendto(packet.encode("ascii"), (IPADDRESS, PORT))
 
 
-def main(): 
+def main():
 
-    joystick = Connecting_Controller()
+    joystick = None   # stays None until a controller is plugged in
     winch_selection = {"camera": False, "cameraCommand": 0, "dart": False, "dartCommand": 0}
     angle = {"current_angle": 90, "new_angle": 90, "mode": False}
-    while True:
-        thrust = read_thrust_ps4(joystick)
-        pygame.time.wait(100)
-        if thrust == 1500: 
-            angle = change_servo_angle(angle)
-            update_winch_selection(joystick, winch_selection)
-            get_winch_command(joystick, winch_selection)
+
+    app = QApplication(sys.argv)
+    window = PilotWindow()
+    window.show()
+
+    def control_pass():
+        # One pass of your old while loop. Runs every 50 ms (20 Hz).
+        nonlocal joystick
+
+        # Unplugged since the last pass
+        if joystick is not None and pygame.joystick.get_count() == 0:
+            joystick = None
+            window.set_controller(None)
+
+        # Look for a controller until one appears
+        if joystick is None:
+            joystick = get_controller()
+            if joystick is not None:
+                pygame.event.clear()   # drop button presses queued before the connection
+                window.set_controller(joystick.get_name())
+
+        if joystick is None:
+            # No controller: send a neutral packet and ignore all input
+            thrust = 1500
+            winch_selection["cameraCommand"] = 0
+            winch_selection["dartCommand"] = 0
         else:
-            pygame.event.clear()  
+            thrust = read_thrust_ps4(joystick)
+            if thrust == 1500:
+                change_servo_angle(angle)
+                update_winch_selection(joystick, winch_selection)
+                get_winch_command(joystick, winch_selection)
+            else:
+                pygame.event.clear()
+                winch_selection["cameraCommand"] = 0
+                winch_selection["dartCommand"] = 0
 
         packet = build_packet(thrust, winch_selection, angle)
         send_packet(packet)
-        
+        window.set_state(thrust, angle, winch_selection)
+
+    timer = QTimer()
+    timer.timeout.connect(control_pass)
+    timer.start(50)
+
+    sys.exit(app.exec())
 
 
 main()
-
