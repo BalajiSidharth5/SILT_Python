@@ -1,4 +1,5 @@
 import os
+import time
 os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"  # keep joystick events when the Qt window has focus
 
 import sys
@@ -25,7 +26,10 @@ RB = 10
 IPADDRESS = "127.0.0.1"
 PORT = 5005
 
-# Connecting Controller
+# IP Address and Port for getting status packets from the PI
+
+IPADDRESS_STATUS = "0.0.0.0"
+PORT_STATUS = 5006
 
 pygame.init()
 pygame.joystick.init()
@@ -148,18 +152,77 @@ def send_packet(packet): # Transfers using UDP
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.sendto(packet.encode("ascii"), (IPADDRESS, PORT))
 
+def parse_status_packet(packet):
+    sensorDataKeys = ["seq", "w1mA", "w1mV", "w2mA", "w2mV", "lat", "lon", "fix", "sats", "hdop", "heading", "pitch", "roll"]
+    sensorDataTypes = [int,   int,    int,    int,    int,    float, float, int,   int,    float,  float,     float,   float]
+    sensorDataDictionary = {}
+    if not packet.startswith("$"):
+        return None
+    starPartition = packet.partition("*")
+    if starPartition[1] != "*":
+        return None
+    data = starPartition[0]
+    checksum = starPartition[2]
+    checksum = checksum.strip()
+    if len(checksum) != 2:
+        return None
+
+    try:
+        int(checksum, 16)
+    except ValueError:
+        return None
+
+    if checksum_calc(data) != int(checksum, 16):
+        return None
+
+    data = data[1:]
+    sensorData = data.split(",")
+    if len(sensorData) != len(sensorDataKeys):
+        return None
+    try:
+        sensorDataDictionary = putListIntoDictionary(sensorData, sensorDataKeys, sensorDataTypes, sensorDataDictionary)
+    except ValueError:
+        return None
+    return sensorDataDictionary
+
+def putListIntoDictionary(sensorData, keys, type_cast, dictionary):
+    for i, value in enumerate(sensorData):
+        dictionary[keys[i]] = type_cast[i](value)
+    return dictionary
+
+def receive_status_packet(sock, status):
+    try:
+        while True:
+            data, addr = sock.recvfrom(1024)
+            packet = data.decode("ascii", errors="replace")
+            data = parse_status_packet(packet)
+            if data is None:
+                status["rejected"] += 1
+            else:
+                status["data"] = data
+                status["last_rx"] = time.monotonic()
+    except BlockingIOError:
+        return status
+    return status
 
 def main():
+
+    r = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    r.bind((IPADDRESS_STATUS, PORT_STATUS))
+    r.setblocking(False)
 
     joystick = None   # stays None until a controller is plugged in
     winch_selection = {"camera": False, "cameraCommand": 0, "dart": False, "dartCommand": 0}
     angle = {"current_angle": 90, "new_angle": 90, "mode": False}
+    status = {"data": None, "last_rx": None, "rejected": 0, "over": {"winch1": False, "winch2": False}}
+
 
     app = QApplication(sys.argv)
     window = PilotWindow()
     window.show()
 
     def control_pass():
+        
         # One pass of your old while loop. Runs every 50 ms (20 Hz).
         nonlocal joystick
 
@@ -193,6 +256,7 @@ def main():
 
         packet = build_packet(thrust, winch_selection, angle)
         send_packet(packet)
+        receive_status_packet(r, status)
         window.set_state(thrust, angle, winch_selection)
 
     timer = QTimer()
@@ -201,5 +265,5 @@ def main():
 
     sys.exit(app.exec())
 
-
-main()
+if __name__ == "__main__":
+    main()
