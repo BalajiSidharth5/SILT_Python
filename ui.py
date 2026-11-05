@@ -43,6 +43,11 @@ RADIUS = 12
 CONNECTION_H = 96
 THRUST_H = 120
 WINCH_H = 120
+ANCHOR_H = 220
+
+# GPS quality below these levels warns the pilot
+MIN_SATS = 6
+MAX_HDOP = 2.0
 
 SANS = ["Inter", "Segoe UI", "SF Pro Display", "Helvetica Neue", "Arial", "DejaVu Sans"]
 MONO = ["JetBrains Mono", "Consolas", "Menlo", "DejaVu Sans Mono", "Courier New"]
@@ -89,6 +94,10 @@ class PilotWindow(QWidget):
         # Video frame. set_video_frame() fills this later with a QImage.
         self.video_frame = None
 
+        # GPS anchor. set_anchor() fills these with anchor_target()'s result and status["data"].
+        self.anchor = None
+        self.gps = None
+
     # ------------------------------------------------------------- inputs
     def set_state(self, thrust, angle, winch_selection):
         self.thrust = thrust
@@ -111,6 +120,12 @@ class PilotWindow(QWidget):
         self.video_frame = qimage
         self.update()
 
+    def set_anchor(self, result, gps_data):
+        """result is anchor_target()'s dictionary, gps_data is status["data"] (None before the first reading)."""
+        self.anchor = result
+        self.gps = gps_data
+        self.update()
+
     # ------------------------------------------------------------- layout
     def layout_rects(self):
         w, h = self.width(), self.height()
@@ -118,7 +133,8 @@ class PilotWindow(QWidget):
         top = header.bottom() + GAP
         content_h = h - MARGIN - top
         side_x = w - MARGIN - SIDEBAR_W
-        camera = QRectF(MARGIN, top, side_x - GAP - MARGIN, content_h)
+        camera = QRectF(MARGIN, top, side_x - GAP - MARGIN, content_h - ANCHOR_H - GAP)
+        anchor = QRectF(MARGIN, camera.bottom() + GAP, camera.width(), ANCHOR_H)
 
         servo_h = content_h - CONNECTION_H - THRUST_H - WINCH_H - 3 * GAP
         y = top
@@ -129,7 +145,7 @@ class PilotWindow(QWidget):
         servo = QRectF(side_x, y, SIDEBAR_W, servo_h)
         y = servo.bottom() + GAP
         winch = QRectF(side_x, y, SIDEBAR_W, WINCH_H)
-        return header, camera, connection, thrust, servo, winch
+        return header, camera, connection, thrust, servo, winch, anchor
 
     # ------------------------------------------------------------- paint
     def paintEvent(self, _event):
@@ -149,12 +165,13 @@ class PilotWindow(QWidget):
         p.end()
 
     def draw_body(self, p):
-        _, camera, connection, thrust, servo, winch = self.layout_rects()
+        _, camera, connection, thrust, servo, winch, anchor = self.layout_rects()
         self.draw_camera(p, camera)
         self.draw_connection(p, connection)
         self.draw_thrust(p, thrust)
         self.draw_servo(p, servo)
         self.draw_winches(p, winch)
+        self.draw_anchor(p, anchor)
 
     def draw_body_grayed(self, p):
         """Draw every panel off screen, strip the color, and lay it back dimmed."""
@@ -581,3 +598,129 @@ class PilotWindow(QWidget):
                 chip_color = WARN
             chip_rect = QRectF(row.right() - 76, row.y() + 5, 66, row.height() - 10)
             self.chip(p, chip_rect, command, chip_color, filled=code != 0)
+
+    # -------------------------------------------------------------- anchor
+    def gps_quality(self):
+        """Chip text and color for the GPS reading."""
+        g = self.gps
+        if g is None:
+            return "NO GPS DATA", FAULT
+        if g["fix"] == 0:
+            return "NO FIX", FAULT
+        text = f"{g['sats']} SATS  HDOP {g['hdop']:.1f}"
+        if g["sats"] < MIN_SATS or g["hdop"] > MAX_HDOP:
+            return "POOR  " + text, WARN
+        return text, OK
+
+    def draw_anchor(self, p, rect):
+        result = self.anchor or {"status": "no anchor", "target_angle": None, "direction": None,
+                                 "age": None, "distance": None, "turn": None}
+        status = result["status"]
+        active = status == "ok"
+        reverse = result["direction"] == "reverse"
+        dir_color = WARN if reverse else ACCENT
+
+        self.panel(p, rect, "GPS ANCHOR", "TRIANGLE SET  ·  X CLEAR")
+
+        # ---- circle: the boat sits in the middle with the bow pointing up,
+        # the anchor dot sits where the anchor lies relative to the bow
+        radius = (rect.height() - 34 - 18) / 2
+        center = QPointF(rect.x() + 24 + radius, rect.y() + 34 + radius)
+
+        p.setPen(QPen(BORDER, 1.5))
+        p.setBrush(QColor(10, 14, 20))
+        p.drawEllipse(center, radius, radius)
+        p.setPen(QPen(with_alpha(TEXT_FAINT, 90), 1, Qt.PenStyle.DashLine))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(center, radius / 2, radius / 2)
+        p.setPen(QPen(with_alpha(TEXT_FAINT, 60), 1))
+        p.drawLine(QPointF(center.x() - radius, center.y()), QPointF(center.x() + radius, center.y()))
+        p.drawLine(QPointF(center.x(), center.y() - radius), QPointF(center.x(), center.y() + radius))
+
+        p.setFont(font(SANS, 9, QFont.Weight.DemiBold, 1.2))
+        p.setPen(TEXT_FAINT)
+        p.drawText(QRectF(center.x() - 20, center.y() - radius + 4, 40, 12), Qt.AlignmentFlag.AlignCenter, "BOW")
+
+        # outer ring distance: smallest step that fits the anchor
+        distance = result["distance"]
+        span = 10
+        if distance is not None:
+            span = next((s for s in (5, 10, 20, 50, 100, 200, 500, 1000) if s >= distance), 1000)
+        p.setFont(font(MONO, 9, QFont.Weight.Medium))
+        p.drawText(QRectF(center.x() + radius * 0.62, center.y() + radius * 0.7, 50, 14),
+                   Qt.AlignmentFlag.AlignLeft, f"{span} m")
+
+        if active:
+            reach = min(distance / span, 1.0) * (radius - 10)
+            rad = math.radians(result["turn"])
+            dot = QPointF(center.x() + reach * math.sin(rad), center.y() - reach * math.cos(rad))
+            style = Qt.PenStyle.DashLine if reverse else Qt.PenStyle.SolidLine
+            p.setPen(QPen(dir_color, 2.5, style, Qt.PenCapStyle.RoundCap))
+            p.drawLine(center, dot)
+            self.glow_dot(p, dot, 5, dir_color)
+        else:
+            messages = {"no anchor": ("NO ANCHOR", TEXT_FAINT),
+                        "no fix": ("NO FIX", FAULT),
+                        "compass dead": ("COMPASS DEAD", FAULT)}
+            text, color = messages.get(status, (status.upper(), FAULT))
+            p.setFont(font(SANS, 10, QFont.Weight.Bold, 1.4))
+            p.setPen(color)
+            p.drawText(QRectF(center.x() - radius, center.y() + 16, 2 * radius, 14), Qt.AlignmentFlag.AlignCenter, text)
+
+        # boat marker, bow up
+        boat = QPainterPath()
+        boat.moveTo(center.x(), center.y() - 9)
+        boat.lineTo(center.x() + 6, center.y() + 7)
+        boat.lineTo(center.x() - 6, center.y() + 7)
+        boat.closeSubpath()
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(TEXT if active else TEXT_FAINT)
+        p.drawPath(boat)
+
+        # ---- numbers beside the circle
+        left = center.x() + radius + 32
+        col_w = (rect.right() - 16 - left) / 3
+
+        if active:
+            direction = "FWD" if not reverse else "REV"
+            target = f"{result['target_angle']:03d}°"
+        else:
+            direction, target = "---", "---°"
+        dist_text = "---" if distance is None else (f"{distance:.1f} m" if distance < 100 else f"{distance:.0f} m")
+
+        big = (("DIRECTION", direction, dir_color if active else TEXT_FAINT),
+               ("TARGET SERVO", target, dir_color if active else TEXT_FAINT),
+               ("DISTANCE", dist_text, TEXT if distance is not None else TEXT_FAINT))
+        for i, (name, value, color) in enumerate(big):
+            x = left + i * col_w
+            p.setFont(font(SANS, 10, QFont.Weight.DemiBold, 1.2))
+            p.setPen(TEXT_FAINT)
+            p.drawText(QRectF(x, rect.y() + 44, col_w, 14), Qt.AlignmentFlag.AlignLeft, name)
+            p.setFont(font(MONO, 26, QFont.Weight.Bold))
+            p.setPen(color)
+            p.drawText(QRectF(x, rect.y() + 58, col_w, 36), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, value)
+
+        age = result["age"]
+        if age is None:
+            age_text = "NONE"
+        else:
+            minutes, seconds = divmod(int(age), 60)
+            hours, minutes = divmod(minutes, 60)
+            age_text = f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+        row_y = rect.y() + 124
+        p.setFont(font(SANS, 10, QFont.Weight.DemiBold, 1.2))
+        p.setPen(TEXT_FAINT)
+        for i, name in enumerate(("ANCHOR AGE", "STATUS", "GPS")):
+            p.drawText(QRectF(left + i * col_w, row_y, col_w, 14), Qt.AlignmentFlag.AlignLeft, name)
+
+        p.setFont(font(MONO, 16, QFont.Weight.Medium))
+        p.setPen(TEXT_DIM if age is not None else TEXT_FAINT)
+        p.drawText(QRectF(left, row_y + 16, col_w, 26), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, age_text)
+
+        status_colors = {"ok": OK, "no anchor": TEXT_FAINT}
+        chip_w = col_w - 16
+        self.chip(p, QRectF(left + col_w, row_y + 17, chip_w, 24), status.upper(),
+                  status_colors.get(status, FAULT), filled=status != "no anchor")
+        gps_text, gps_color = self.gps_quality()
+        self.chip(p, QRectF(left + 2 * col_w, row_y + 17, chip_w, 24), gps_text, gps_color, filled=gps_color != OK)

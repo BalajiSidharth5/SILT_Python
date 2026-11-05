@@ -8,6 +8,7 @@ import socket
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 from ui import PilotWindow
+from anchor import new_anchor, set_anchor, clear_anchor, anchor_target
 
 # Constants
 
@@ -16,8 +17,10 @@ RT = 5
 DPAD_UP = 11
 DPAD_LEFT = 13
 DPAD_RIGHT = 14
+CROSS = 0
 CIRCLE = 1
 SQUARE = 2
+TRIANGLE = 3
 LB = 9
 RB = 10
 
@@ -128,6 +131,20 @@ def get_winch_command(joystick, winch_selection):
             winch_selection["dartCommand"] = 0
     return winch_selection
 
+def update_anchor(joystick, anchor, data, held):
+    # Triangle saves the anchor, X clears it. Acts once per press, not every pass the button is held.
+    # Reads button state instead of events so it does not compete with get_dpad_presses().
+    pygame.event.pump()
+    triangle = joystick.get_button(TRIANGLE)
+    cross = joystick.get_button(CROSS)
+    if triangle and not held["triangle"]:
+        set_anchor(anchor, data)   # refused while there is no GPS fix
+    if cross and not held["cross"]:
+        clear_anchor(anchor)
+    held["triangle"] = triangle
+    held["cross"] = cross
+    return anchor
+
 def checksum_calc(data):
     checksum = 0
     startBytePassed = False
@@ -215,6 +232,8 @@ def main():
     winch_selection = {"camera": False, "cameraCommand": 0, "dart": False, "dartCommand": 0}
     angle = {"current_angle": 90, "new_angle": 90, "mode": False}
     status = {"data": None, "last_rx": None, "rejected": 0, "over": {"winch1": False, "winch2": False}}
+    anchor = new_anchor()
+    anchor_held = {"triangle": False, "cross": False}
 
 
     app = QApplication(sys.argv)
@@ -257,7 +276,15 @@ def main():
         packet = build_packet(thrust, winch_selection, angle)
         send_packet(packet)
         receive_status_packet(r, status)
+
+        if joystick is not None:
+            update_anchor(joystick, anchor, status["data"], anchor_held)
+        else:
+            anchor_held["triangle"] = anchor_held["cross"] = False
+        anchor_result = anchor_target(anchor, status["data"])
+
         window.set_state(thrust, angle, winch_selection)
+        window.set_anchor(anchor_result, status["data"])
 
     timer = QTimer()
     timer.timeout.connect(control_pass)
